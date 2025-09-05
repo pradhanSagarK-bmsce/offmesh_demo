@@ -1,23 +1,24 @@
-/// Flutter OffMesh Prototype — robust main.dart
-/// BLE chat + file transfer with ACK/retry (controlled dev environment)
+/// Flutter OffMesh Prototype — full main.dart
+/// BLE chat + file transfer with ACK/retry (research prototype)
 ///
-/// Notes:
-/// - Requires flutter_reactive_ble, flutter_ble_peripheral,
-///   cryptography, flutter_secure_storage, path_provider, permission_handler
-/// - Ensure AndroidManifest contains Bluetooth permissions (see earlier message)
-/// - This is a prototype/demo: no encryption/auth is performed on packets.
+/// Restored full file-transfer path, improved UI, and robust handlers.
+/// This file is large by design (detailed comments + functionality).
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart' as perms;
+import 'package:file_picker/file_picker.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,25 +31,44 @@ class OffMeshApp extends StatefulWidget {
   State<OffMeshApp> createState() => _OffMeshAppState();
 }
 
+// -----------------------------------------------------------------------------
+// IMPORTANT NOTES
+// - This is a research / test-only prototype. It does NOT provide encryption
+//   or authentication for messages. Do not use in production.
+// - Make sure AndroidManifest contains the Bluetooth and storage permissions
+//   (compile-time). At runtime we also request permissions.
+// - Some plugin APIs change between versions; advertising call is wrapped in
+//   try/catch to avoid hard crashes when method signatures differ.
+// -----------------------------------------------------------------------------
+
 class _OffMeshAppState extends State<OffMeshApp> {
   // --- BLE & UUIDs
   final flutterReactiveBle = FlutterReactiveBle();
   final peripheral = FlutterBlePeripheral();
 
-  // Use reactive_ble's Uuid type (these are example UUIDs)
+  // example service/characteristic UUIDs (change for your setup if needed)
   final Uuid _serviceUuid = Uuid.parse('12345678-1234-5678-1234-56789abcdef0');
   final Uuid _charInbox = Uuid.parse('12345678-1234-5678-1234-56789abcdef1');
   final Uuid _charOutbox = Uuid.parse('12345678-1234-5678-1234-56789abcdef2');
   final Uuid _charInfo = Uuid.parse('12345678-1234-5678-1234-56789abcdef3');
 
+  // secure storage for node identity
   final storage = const FlutterSecureStorage();
   SimpleKeyPair? myKeypair;
-  String? myNodeHex; // nullable until created/loaded
+  String? myNodeHex; // short public id (hex prefix)
 
+  // peers / subscriptions
   final Map<String, DiscoveredDevice> _peers = {};
   final Map<String, StreamSubscription<List<int>>> _outboxSubs = {};
+
+  // pending acks for reliable send
   final Map<int, Completer<bool>> _pendingAcks = {};
+
+  // incoming files map: baseFileId -> FileState
   final Map<int, _FileState> _incomingFiles = {};
+
+  // outgoing file tracking
+  final Map<int, _OutgoingFileState> _outgoingFiles = {};
 
   // constants
   static const int maxTtl = 5;
@@ -70,7 +90,8 @@ class _OffMeshAppState extends State<OffMeshApp> {
   }
 
   Future<void> _initAll() async {
-    // 1) request necessary BLE & storage permissions
+    _log('Initializing OffMesh...');
+
     try {
       final ok = await _requestBlePermissions();
       if (!ok) {
@@ -79,48 +100,41 @@ class _OffMeshAppState extends State<OffMeshApp> {
       }
     } catch (e) {
       _log('Permission request failed: $e');
-      // continue — permission request failing should not crash; scanning will fail later
     }
 
-    // 2) load or create the persistent keypair / node id
     await _loadOrCreateKeypair();
 
     if (myNodeHex == null) {
-      _log('❌ Failed to load or create node identity');
+      _log('❌ Failed to load/create node identity');
       return;
     }
 
-    // 3) safe start advertising & scanning
     try {
       await _startAdvertising();
     } catch (e) {
-      _log("Start advertising failed: $e");
+      _log('Start advertising failed: $e');
     }
 
     try {
       _startScan();
     } catch (e) {
-      _log("Start scan failed: $e");
+      _log('Start scan failed: $e');
     }
 
     setState(() {});
   }
 
-  /// Request BLE & storage related permissions.
-  /// Returns true if required permissions look granted enough to proceed.
+  // ---------- Permissions ----------------------------------------------------
   Future<bool> _requestBlePermissions() async {
     try {
-      // Request the newest Bluetooth permissions (Android 12+). permission_handler
-      // exposes them as Permission.bluetoothScan/connect/advertise.
       final statuses = await [
         perms.Permission.bluetoothScan,
         perms.Permission.bluetoothConnect,
         perms.Permission.bluetoothAdvertise,
-        perms.Permission.location, // for older Android scans
+        perms.Permission.location, // older Android
         perms.Permission.storage,
       ].request();
 
-      // Check at least bluetoothScan and bluetoothConnect are granted (or limited).
       final scanStatus = statuses[perms.Permission.bluetoothScan];
       final connectStatus = statuses[perms.Permission.bluetoothConnect];
 
@@ -130,17 +144,15 @@ class _OffMeshAppState extends State<OffMeshApp> {
           (connectStatus == perms.PermissionStatus.granted ||
               connectStatus == perms.PermissionStatus.limited);
 
-      // If location is required on older Android, require it too.
       final loc = statuses[perms.Permission.location];
       if ((Platform.isAndroid) && loc != perms.PermissionStatus.granted) {
-        // on older Android scanning may require location; log but allow to continue
         _log(
           'Warning: location permission not granted; scans on older Android may fail.',
         );
       }
 
       _log(
-        'Permissions result: ${statuses.map((k, v) => MapEntry(k.toString(), v.toString()))}',
+        'Permissions: ${statuses.map((k, v) => MapEntry(k.toString(), v.toString()))}',
       );
       return ok;
     } catch (e) {
@@ -149,13 +161,13 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
+  // ---------- Identity (keypair) -------------------------------------------
   Future<void> _loadOrCreateKeypair() async {
     try {
       final pubHex = await storage.read(key: 'pub');
       final privHex = await storage.read(key: 'priv');
 
       if (pubHex != null && privHex != null) {
-        // reconstruct simple keypair from saved hex (prototype only)
         myKeypair = SimpleKeyPairData(
           Uint8List.fromList(_hexToBytes(privHex)),
           publicKey: SimplePublicKey(
@@ -169,7 +181,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
         return;
       }
 
-      // else create
+      // create new
       final algorithm = Ed25519();
       final kp = await algorithm.newKeyPair();
       final pub = await kp.extractPublicKey();
@@ -186,6 +198,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
+  // ---------- Advertising & Scanning ---------------------------------------
   Future<void> _startAdvertising() async {
     if (myNodeHex == null) return;
     try {
@@ -198,14 +211,12 @@ class _OffMeshAppState extends State<OffMeshApp> {
 
       final advertiseData = AdvertiseData(
         includeDeviceName: true,
-        // serviceUuid and manufacturer fields depend on plugin version
         serviceUuid: _serviceUuid.toString(),
         manufacturerId: 0x02AC,
         manufacturerData: Uint8List.fromList(_hexToBytes(myNodeHex!)),
       );
 
-      // Many plugin versions expose start({advertiseData, advertiseSettings})
-      // If your plugin has a different signature, adjust accordingly.
+      // some versions expose a different API; we wrap in try/catch
       await peripheral.start(
         advertiseData: advertiseData,
         advertiseSettings: advertiseSettings,
@@ -213,7 +224,6 @@ class _OffMeshAppState extends State<OffMeshApp> {
 
       _log('📡 Advertising as $myNodeHex');
     } catch (e) {
-      // If the method signature differs on your plugin version, this will catch it.
       _log('Advertise start failed (plugin mismatch or runtime error): $e');
     }
   }
@@ -221,7 +231,6 @@ class _OffMeshAppState extends State<OffMeshApp> {
   void _startScan() {
     _log('🔎 Scanning...');
     try {
-      // scanForDevices returns a stream of DiscoveredDevice
       flutterReactiveBle
           .scanForDevices(withServices: [_serviceUuid])
           .listen(
@@ -237,7 +246,6 @@ class _OffMeshAppState extends State<OffMeshApp> {
               }
             },
             onError: (e) {
-              // Many runtime errors here are permission or platform issues; we log them.
               _log('Scan stream error: $e');
             },
           );
@@ -305,11 +313,12 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
+  // ---------- Packet handling ----------------------------------------------
   void _handlePacket(String fromDeviceId, Packet pkt) {
     try {
       if (_seen(pkt.pktId)) return;
 
-      // send ACK back to the sender only (simple prototype)
+      // send ACK back to sender only
       if (pkt.type != typeAck && myNodeId != null) {
         final ack = Packet(
           typeAck,
@@ -332,25 +341,11 @@ class _OffMeshAppState extends State<OffMeshApp> {
           break;
 
         case typeFileMeta:
-          final parts = utf8.decode(pkt.payload).split('|');
-          final name = parts.isNotEmpty ? parts[0] : 'unknown';
-          final size = parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
-          _incomingFiles[pkt.pktId] = _FileState(name, size);
-          _log('📁 Incoming $name ($size bytes)');
+          _handleIncomingFileMeta(pkt);
           break;
 
         case typeFileChunk:
-          final fs = _incomingFiles[pkt.pktId];
-          if (fs != null) {
-            fs.received.add(pkt.payload);
-            _log(
-              '▶ Chunk for ${fs.name}: ${fs.received.length}/${fs.total ?? -1}',
-            );
-            if (fs.total != null && fs.received.length >= fs.total!) {
-              _saveFile(fs);
-              _incomingFiles.remove(pkt.pktId);
-            }
-          }
+          _handleIncomingFileChunk(pkt);
           break;
 
         case typeAck:
@@ -362,6 +357,58 @@ class _OffMeshAppState extends State<OffMeshApp> {
       }
     } catch (e) {
       _log('Handle packet error: $e');
+    }
+  }
+
+  void _handleIncomingFileMeta(Packet pkt) {
+    try {
+      final payload = pkt.payload;
+      if (payload.length < 4) {
+        _log('FileMeta: payload too short');
+        return;
+      }
+      final baseId = _u32From(payload, 0);
+      final rest = utf8.decode(payload.sublist(4));
+      final parts = rest.split('|');
+      final name = parts.isNotEmpty ? parts[0] : 'unknown';
+      final total = parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
+      final size = parts.length > 2 ? int.tryParse(parts[2]) ?? 0 : 0;
+
+      final fs = _FileState.full(name, total, size);
+      _incomingFiles[baseId] = fs;
+      _log(
+        '📁 Incoming file meta: $name (chunks=$total, bytes=$size) id=$baseId',
+      );
+    } catch (e) {
+      _log('FileMeta handling error: $e');
+    }
+  }
+
+  void _handleIncomingFileChunk(Packet pkt) {
+    try {
+      final payload = pkt.payload;
+      if (payload.length < 6) {
+        _log('FileChunk: payload too short');
+        return;
+      }
+      final baseId = _u32From(payload, 0);
+      final idx = _u16From(Uint8List.fromList(payload), 4);
+      final data = payload.sublist(6);
+      final fs = _incomingFiles[baseId];
+      if (fs == null) {
+        _log('FileChunk for unknown id $baseId (idx=$idx)');
+        return;
+      }
+      fs.addChunk(idx, Uint8List.fromList(data));
+      _log(
+        '▶ Received chunk $idx for ${fs.name} (${fs.receivedCount}/${fs.total ?? -1})',
+      );
+      if (fs.isComplete) {
+        _saveIncomingFile(baseId, fs);
+        _incomingFiles.remove(baseId);
+      }
+    } catch (e) {
+      _log('FileChunk handling error: $e');
     }
   }
 
@@ -387,17 +434,19 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
-  Future<void> _saveFile(_FileState fs) async {
+  Future<void> _saveIncomingFile(int baseId, _FileState fs) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final f = File('${dir.path}/${fs.name}');
-      await f.writeAsBytes(fs.received.takeBytes());
-      _log('✅ File saved: ${fs.name} -> ${f.path}');
+      final bytes = fs.assemble();
+      await f.writeAsBytes(bytes);
+      _log('✅ Incoming file saved: ${fs.name} -> ${f.path}');
     } catch (e) {
-      _log('Save file failed: $e');
+      _log('Save incoming file failed: $e');
     }
   }
 
+  // ---------- Low-level send -----------------------------------------------
   Future<void> _sendPacketRawToDevice(String deviceId, List<int> bytes) async {
     try {
       final q = QualifiedCharacteristic(
@@ -415,7 +464,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
-  /// Reliable send: broadcast to all connected peers in prototype.
+  // Broadcast reliable send: we send to all connected peers and wait for any ACK
   Future<void> _sendReliable(
     int dstId,
     int pktId,
@@ -438,7 +487,6 @@ class _OffMeshAppState extends State<OffMeshApp> {
 
       while (attempt < retries && !completer.isCompleted) {
         attempt++;
-        // broadcast to all connected peers in prototype mode
         for (final entry in _peers.entries) {
           try {
             await _sendPacketRawToDevice(entry.key, bytes);
@@ -467,6 +515,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
+  // ---------- Chat send ---------------------------------------------------
   void _sendChat(String text) {
     try {
       final pktId = DateTime.now().millisecondsSinceEpoch & 0x7FFFFFFF;
@@ -482,15 +531,94 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
+  // ---------- File send (full path restored) -------------------------------
+  /// Choose a file and send using file meta + chunked payloads.
+  Future<void> _pickAndSendFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles();
+      if (result == null || result.files.isEmpty) return;
+      final picked = result.files.first;
+      final path = picked.path;
+      if (path == null) return;
+
+      final f = File(path);
+      final bytes = await f.readAsBytes();
+      final name = p.basename(path);
+      await _sendFileBytes(name, bytes);
+    } catch (e) {
+      _log('File pick/send error: $e');
+    }
+  }
+
+  Future<void> _sendFileBytes(String name, Uint8List bytes) async {
+    try {
+      // choose chunk size small enough to fit typical BLE MTU
+      const int chunkSize = 512; // prototype
+      final totalChunks = (bytes.length / chunkSize).ceil();
+      final baseId = _random32();
+
+      // register outgoing file for progress UI
+      final ofs = _OutgoingFileState(name, bytes.length, totalChunks);
+      _outgoingFiles[baseId] = ofs;
+
+      // create meta payload: [u32 baseId] + utf8('name|chunks|size')
+      final metaText = '$name|$totalChunks|${bytes.length}';
+      final metaPayload = BytesBuilder();
+      metaPayload.add(_u32(baseId));
+      metaPayload.add(utf8.encode(metaText));
+
+      final metaPktId = baseId ^ 0xA5A50000;
+      await _sendReliable(
+        0xFFFF,
+        metaPktId,
+        typeFileMeta,
+        metaPayload.takeBytes(),
+      );
+
+      // send chunks
+      for (int i = 0; i < totalChunks; i++) {
+        final off = i * chunkSize;
+        final end = min(off + chunkSize, bytes.length);
+        final chunk = bytes.sublist(off, end);
+        final chunkPayload = BytesBuilder();
+        chunkPayload.add(_u32(baseId)); // identify which file
+        chunkPayload.add(_u16(i)); // chunk index
+        chunkPayload.add(chunk);
+        final pktId = baseId ^ (i & 0xFFFF);
+
+        // update UI state
+        ofs.sentChunks = i + 1;
+        setState(() {});
+
+        await _sendReliable(
+          0xFFFF,
+          pktId,
+          typeFileChunk,
+          chunkPayload.takeBytes(),
+        );
+
+        // mark chunk ack progress inside outgoing state if ack arrived
+        if (_pendingAcks[pktId] == null) {
+          // ack already completed
+          ofs.ackedChunks++;
+        }
+      }
+
+      _log('📤 File send finished (meta+chunks): $name');
+      _outgoingFiles.remove(baseId);
+    } catch (e) {
+      _log('Send file error: $e');
+    }
+  }
+
+  // ---------- Utility & helpers -------------------------------------------
   void _log(String m) {
     try {
       setState(() {
         _logs.insert(0, '${DateTime.now().toIso8601String()}  $m');
-        if (_logs.length > 1000) _logs.removeRange(1000, _logs.length);
+        if (_logs.length > 2000) _logs.removeRange(2000, _logs.length);
       });
-    } catch (_) {
-      // ignore UI update errors
-    }
+    } catch (_) {}
   }
 
   @override
@@ -504,6 +632,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
     super.dispose();
   }
 
+  // ---------- UI ----------------------------------------------------------
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -527,20 +656,24 @@ class _OffMeshAppState extends State<OffMeshApp> {
             children: [
               const Icon(Icons.memory, color: Colors.greenAccent, size: 20),
               const SizedBox(width: 8),
-              Text("OffMesh Node ${myNodeHex ?? "?"}"),
+              Text('OffMesh Node ${myNodeHex ?? "?"}'),
             ],
           ),
           actions: [
             IconButton(
+              icon: const Icon(Icons.attach_file, color: Colors.greenAccent),
+              tooltip: 'Send file',
+              onPressed: _pickAndSendFile,
+            ),
+            IconButton(
               icon: const Icon(Icons.refresh, color: Colors.greenAccent),
-              tooltip: "Rescan Devices",
+              tooltip: 'Rescan Devices',
               onPressed: _startScan,
             ),
           ],
         ),
         body: Column(
           children: [
-            // chat/log area
             Expanded(
               child: Container(
                 padding: const EdgeInsets.all(12),
@@ -556,25 +689,26 @@ class _OffMeshAppState extends State<OffMeshApp> {
                   itemCount: _logs.length,
                   itemBuilder: (_, i) {
                     final text = _logs[i];
-                    final isMe = text.contains("➡️ Me:");
+                    final isMe = text.contains('➡️ Me:');
                     final isSystem =
-                        text.contains("📡") ||
-                        text.contains("🔎") ||
-                        text.contains("🔗") ||
-                        text.contains("🔌") ||
-                        text.contains("❌") ||
-                        text.contains("✅") ||
-                        text.contains("⏳") ||
-                        text.contains("Warning");
+                        text.contains('📡') ||
+                        text.contains('🔎') ||
+                        text.contains('🔗') ||
+                        text.contains('🔌') ||
+                        text.contains('❌') ||
+                        text.contains('✅') ||
+                        text.contains('⏳') ||
+                        text.contains('Warning') ||
+                        text.contains('📁') ||
+                        text.contains('TX ->');
 
-                    // system logs get monospace label style
                     if (isSystem) {
                       return Container(
-                        margin: const EdgeInsets.symmetric(vertical: 2),
+                        margin: const EdgeInsets.symmetric(vertical: 4),
                         child: Text(
                           text,
                           style: const TextStyle(
-                            fontFamily: "monospace",
+                            fontFamily: 'monospace',
                             fontSize: 12,
                             color: Colors.white70,
                           ),
@@ -582,26 +716,25 @@ class _OffMeshAppState extends State<OffMeshApp> {
                       );
                     }
 
-                    // chat bubbles
                     return Align(
                       alignment: isMe
                           ? Alignment.centerRight
                           : Alignment.centerLeft,
                       child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        margin: const EdgeInsets.symmetric(vertical: 6),
                         padding: const EdgeInsets.symmetric(
-                          vertical: 8,
-                          horizontal: 12,
+                          vertical: 10,
+                          horizontal: 14,
                         ),
-                        constraints: const BoxConstraints(maxWidth: 280),
+                        constraints: const BoxConstraints(maxWidth: 320),
                         decoration: BoxDecoration(
                           color: isMe
-                              ? Colors.greenAccent.withOpacity(0.15)
-                              : Colors.white.withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(12),
+                              ? Colors.greenAccent.withOpacity(0.14)
+                              : Colors.white.withOpacity(0.04),
+                          borderRadius: BorderRadius.circular(14),
                           border: Border.all(
                             color: isMe
-                                ? Colors.greenAccent.withOpacity(0.4)
+                                ? Colors.greenAccent.withOpacity(0.45)
                                 : Colors.white24,
                             width: 1,
                           ),
@@ -609,7 +742,7 @@ class _OffMeshAppState extends State<OffMeshApp> {
                         child: Text(
                           text,
                           style: TextStyle(
-                            fontFamily: "monospace",
+                            fontFamily: 'monospace',
                             fontSize: 13,
                             color: isMe ? Colors.greenAccent : Colors.white,
                           ),
@@ -620,6 +753,24 @@ class _OffMeshAppState extends State<OffMeshApp> {
                 ),
               ),
             ),
+
+            // outgoing/incoming file progress small area
+            if (_outgoingFiles.isNotEmpty || _incomingFiles.isNotEmpty)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                color: const Color(0xFF111111),
+                child: Column(
+                  children: [
+                    for (final e in _outgoingFiles.entries)
+                      _buildOutgoingProgress(e.key, e.value),
+                    for (final e in _incomingFiles.entries)
+                      _buildIncomingProgress(e.key, e.value),
+                  ],
+                ),
+              ),
 
             // input box
             Container(
@@ -686,7 +837,64 @@ class _OffMeshAppState extends State<OffMeshApp> {
     );
   }
 
-  /// Convert hex -> bytes (safe)
+  Widget _buildOutgoingProgress(int id, _OutgoingFileState ofs) {
+    final pct = ofs.totalChunks > 0 ? ofs.ackedChunks / ofs.totalChunks : 0.0;
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${ofs.name} (upload) — ${ofs.ackedChunks}/${ofs.totalChunks}',
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(value: pct),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            icon: const Icon(Icons.cancel, color: Colors.redAccent),
+            onPressed: () {
+              // cancelling not implemented in prototype; just remove UI
+              setState(() => _outgoingFiles.remove(id));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildIncomingProgress(int id, _FileState fs) {
+    final pct = (fs.total != null && fs.total! > 0)
+        ? (fs.receivedCount / (fs.total ?? 1))
+        : (fs.receivedCount > 0 ? 0.5 : 0.0);
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${fs.name} (download) — ${fs.receivedCount}/${fs.total ?? "?"}',
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(value: pct),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+    );
+  }
+
+  // ---------- Byte helpers -------------------------------------------------
   List<int> _hexToBytes(String hex) {
     try {
       final clean = hex.replaceAll(RegExp('[^0-9A-Fa-f]'), '');
@@ -701,7 +909,6 @@ class _OffMeshAppState extends State<OffMeshApp> {
     }
   }
 
-  /// Convert bytes -> hex (safe)
   String _bytesToHex(List<int> bytes) {
     try {
       return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -710,26 +917,82 @@ class _OffMeshAppState extends State<OffMeshApp> {
       return '';
     }
   }
+
+  List<int> _u16(int v) => [(v >> 8) & 0xFF, v & 0xFF];
+  List<int> _u32(int v) => [
+    (v >> 24) & 0xFF,
+    (v >> 16) & 0xFF,
+    (v >> 8) & 0xFF,
+    v & 0xFF,
+  ];
+
+  int _u16From(Uint8List d, int off) => (d[off] << 8) | d[off + 1];
+  int _u32From(List<int> d, int off) =>
+      (d[off] << 24) | (d[off + 1] << 16) | (d[off + 2] << 8) | d[off + 3];
+
+  int _random32() {
+    final rnd = Random.secure();
+    return rnd.nextInt(0x7FFFFFFF);
+  }
+
+  static int _u16FromStatic(Uint8List d, int off) => (d[off] << 8) | d[off + 1];
 }
 
-// ------------ helpers ------------
+// ---------------------------------------------------------------------------
+// Helper classes: File state, Packet format, outgoing tracking
+// ---------------------------------------------------------------------------
 
 class _FileState {
   final String name;
-  final int? total;
-  final BytesBuilder received = BytesBuilder();
-  _FileState(this.name, this.total);
+  final int? total; // number of chunks
+  final int? bytesTotal; // total bytes
+  final List<Uint8List?> _chunks;
+  int receivedCount = 0;
+
+  _FileState(this.name, this.total)
+    : _chunks = List<Uint8List?>.filled(total ?? 0, null),
+      bytesTotal = null;
+
+  _FileState.full(this.name, this.total, this.bytesTotal)
+    : _chunks = List<Uint8List?>.filled(total ?? 0, null);
+
+  void addChunk(int idx, Uint8List data) {
+    if (idx < 0 || (total != null && idx >= total!)) return;
+    if (_chunks[idx] == null) {
+      _chunks[idx] = data;
+      receivedCount++;
+    }
+  }
+
+  bool get isComplete => (total != null) && receivedCount >= (total ?? 0);
+
+  Uint8List assemble() {
+    final out = BytesBuilder();
+    for (var c in _chunks) {
+      if (c != null) out.add(c);
+    }
+    return out.takeBytes();
+  }
 }
 
-/// Packet layout:
-/// [type:1][ttl:1][src:2][dst:2][pktId:2][len:2][payload:len]
+class _OutgoingFileState {
+  final String name;
+  final int totalBytes;
+  final int totalChunks;
+  int sentChunks = 0;
+  int ackedChunks = 0;
+
+  _OutgoingFileState(this.name, this.totalBytes, this.totalChunks);
+}
+
+/// Packet layout and helpers
 class Packet {
-  final int type;
-  final int srcId;
-  final int dstId;
-  final int pktId;
-  final Uint8List payload;
-  final int ttl;
+  final int type; // 1 byte
+  final int srcId; // 2 bytes
+  final int dstId; // 2 bytes
+  final int pktId; // 2 bytes (prototype limited)
+  final Uint8List payload; // up to 65535 in this format
+  final int ttl; // 1 byte
 
   Packet(this.type, this.srcId, this.dstId, this.pktId, this.payload, this.ttl);
 
@@ -737,10 +1000,10 @@ class Packet {
     final b = BytesBuilder();
     b.addByte(type & 0xFF);
     b.addByte(ttl & 0xFF);
-    b.add(_u16(srcId));
-    b.add(_u16(dstId));
-    b.add(_u16(pktId));
-    b.add(_u16(payload.length));
+    b.add(_u16Static(srcId));
+    b.add(_u16Static(dstId));
+    b.add(_u16Static(pktId));
+    b.add(_u16Static(payload.length));
     b.add(payload);
     return b.takeBytes();
   }
@@ -750,15 +1013,15 @@ class Packet {
     if (d.length < 10) throw FormatException('Packet too short');
     final type = d[0];
     final ttl = d[1];
-    final src = _u16From(d, 2);
-    final dst = _u16From(d, 4);
-    final pktId = _u16From(d, 6);
-    final len = _u16From(d, 8);
+    final src = _u16FromStatic(d, 2);
+    final dst = _u16FromStatic(d, 4);
+    final pktId = _u16FromStatic(d, 6);
+    final len = _u16FromStatic(d, 8);
     if (d.length < 10 + len) throw FormatException('Truncated payload');
     final payload = Uint8List.fromList(d.sublist(10, 10 + len));
     return Packet(type, src, dst, pktId, payload, ttl);
   }
 
-  static List<int> _u16(int v) => [(v >> 8) & 0xFF, v & 0xFF];
-  static int _u16From(Uint8List d, int off) => (d[off] << 8) | d[off + 1];
+  static List<int> _u16Static(int v) => [(v >> 8) & 0xFF, v & 0xFF];
+  static int _u16FromStatic(Uint8List d, int off) => (d[off] << 8) | d[off + 1];
 }
